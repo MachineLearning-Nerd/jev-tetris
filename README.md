@@ -12,9 +12,7 @@ to select one typed option, and let ordinary code verify and execute the choice.
 
 [![Watch the Jev explainer](video/jev_explainer_landscape_poster.png)](video/jev_explainer_landscape.mp4)
 
-The video is narrated with a calm Kokoro voice and includes a real capture of
-Jev playing Tetris. [Download the 16:9 video](video/jev_explainer_landscape.mp4) ·
-[View the render notes and sources](video/README.md)
+[Watch the narrated 16:9 explainer](video/jev_explainer_landscape.mp4)
 
 ## Why this demo is interesting
 
