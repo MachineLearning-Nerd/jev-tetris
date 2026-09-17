@@ -39,8 +39,11 @@ flowchart LR
 - five-piece next queue;
 - ghost landing preview;
 - visible rotation, movement, drop, and lock animation;
+- one-shot `Ask Jev for Placement` mode for inspecting a single decision;
+- `Jev Playing Tetris` mode that keeps making verified placements until paused;
 - local deterministic planner for testing without an API key;
 - live Jev mode with confidence and alternative probabilities;
+- inspectable request/response trace with a JSON export for every decision;
 - exact placement verification before every lock;
 - synthetic local state only — no company data.
 
@@ -63,6 +66,19 @@ uv run streamlit run app.py
 
 The key is read by Python and is never sent to the browser. `.env.example`
 documents the optional variable without containing a secret.
+
+The control deck has two play modes. `Ask Jev for Placement` advances one piece
+so you can inspect its rotation, column, landing row, and confidence. `Jev
+Playing Tetris` repeats the same typed-choice, verify, animate, and lock loop one
+piece at a time until you press `Pause Jev` or the board reaches game over.
+Without an API key, both controls use the deterministic local planner so the full
+interaction remains testable.
+
+After a placement, use `View JSON input · state and question` and `View JSON
+output · Jev response` to inspect the decision in collapsible panels. `Export
+JSON trace` downloads the complete decision history for the current game,
+including each selected placement, confidence, probabilities, and verified
+result. Local-planner traces are labeled as previews and are not sent to Jev.
 
 ## Run the checks
 

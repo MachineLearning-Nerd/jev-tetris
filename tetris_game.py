@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import random
 import time
+from collections import deque
 from collections.abc import Mapping
 from typing import Any
 
@@ -428,13 +430,18 @@ def fixture_next_move(state: dict[str, Any]) -> tuple[str, float]:
     return "drop", 0.9
 
 
-def live_next_placement(
+_PLACEMENT_QUESTION = (
+    "Choose exactly one candidate ID from the legal placements. "
+    "The ID is the only valid answer. Prefer a strong afterstate and "
+    "future flexibility over an immediate line clear that creates holes."
+)
+
+
+def jev_request_for_placement(
     state: dict[str, Any],
     model: str = "jev-latest",
-) -> tuple[dict[str, Any], float, dict[str, float]]:
-    from typesafe_sdk import Choice, TypeSafeClient
-
-    candidates = legal_placements(state)
+) -> dict[str, Any]:
+    jev_state = game_state_for_jev(state)
     criteria = {
         candidate["id"]: (
             f"Place {state['kind']} in rotation {candidate['rotation_name']} with "
@@ -446,25 +453,69 @@ def live_next_placement(
             f"{candidate['features']['bumpiness']}, next-piece score="
             f"{candidate['next_best_score']}."
         )
-        for candidate in candidates
+        for candidate in jev_state["legal_placements"]
     }
+    return {
+        "model": model,
+        "state": jev_state,
+        "questions": {
+            "placement": {
+                "type": "Choice",
+                "instructions": _PLACEMENT_QUESTION,
+                "criteria": criteria,
+            }
+        },
+    }
+
+
+def _placement_trace(
+    *,
+    source: str,
+    request: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    confidence: float,
+    probabilities: Mapping[str, float],
+    request_sent: bool,
+) -> dict[str, Any]:
+    return {
+        "source": source,
+        "request_sent": request_sent,
+        "request": request,
+        "response": {
+            "placement": {
+                "choice": candidate["id"],
+                "confidence": confidence,
+                "probabilities": dict(probabilities),
+            }
+        },
+        "resolved_candidate": candidate,
+    }
+
+
+def live_next_placement(
+    state: dict[str, Any],
+    model: str = "jev-latest",
+    *,
+    request: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], float, dict[str, float]]:
+    from typesafe_sdk import Choice, TypeSafeClient
+
+    request = jev_request_for_placement(state, model) if request is None else request
+    question = request["questions"]["placement"]
     questions = {
         "placement": Choice(
-            instructions=(
-                "Choose exactly one candidate ID from the legal placements. "
-                "The ID is the only valid answer. Prefer a strong afterstate and "
-                "future flexibility over an immediate line clear that creates holes."
-            ),
-            criteria=criteria,
+            instructions=question["instructions"],
+            criteria=question["criteria"],
         )
     }
     with TypeSafeClient() as client:
         response = client.system_one(
-            state=game_state_for_jev(state),
+            state=request["state"],
             questions=questions,
-            model=model,
+            model=request["model"],
         )
 
+    candidates = request["state"]["legal_placements"]
     answers = getattr(response, "answers", {})
     answer = answers.get("placement")
     if answer is None:
@@ -478,6 +529,80 @@ def live_next_placement(
         float(getattr(answer, "confidence", 0.0)),
         dict(getattr(answer, "probabilities", {})),
     )
+
+
+def choose_next_placement(
+    state: dict[str, Any],
+    *,
+    use_live: bool,
+) -> tuple[dict[str, Any], float, dict[str, float], str, dict[str, Any]]:
+    request = jev_request_for_placement(state)
+    if use_live:
+        candidate, confidence, probabilities = live_next_placement(state, request=request)
+        source = "live Jev"
+        return (
+            candidate,
+            confidence,
+            probabilities,
+            source,
+            _placement_trace(
+                source=source,
+                request=request,
+                candidate=candidate,
+                confidence=confidence,
+                probabilities=probabilities,
+                request_sent=True,
+            ),
+        )
+
+    candidate, confidence = fixture_next_placement(state)
+    source = "local planner"
+    return (
+        candidate,
+        confidence,
+        {},
+        source,
+        _placement_trace(
+            source=source,
+            request=request,
+            candidate=candidate,
+            confidence=confidence,
+            probabilities={},
+            request_sent=False,
+        ),
+    )
+
+
+def decision_trace_export(history: list[Mapping[str, Any]]) -> str:
+    return json.dumps(
+        {
+            "format": "jev-tetris-decision-trace-v1",
+            "decisions": history,
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+def _record_decision_trace(
+    history: list[dict[str, Any]],
+    trace: dict[str, Any],
+    state: Mapping[str, Any],
+    mode: str,
+) -> dict[str, Any]:
+    recorded_trace = dict(trace)
+    recorded_trace["sequence"] = len(history) + 1
+    recorded_trace["mode"] = mode
+    recorded_trace["application"] = {
+        "verified": True,
+        "locked": True,
+        "pieces": state["pieces"],
+        "score": state["score"],
+        "lines": state["lines"],
+        "last_lock": state["last_lock"],
+    }
+    history.append(recorded_trace)
+    return recorded_trace
 
 
 def apply_placement(state: dict[str, Any], placement: str | Mapping[str, Any]) -> None:
@@ -667,6 +792,15 @@ def render_tetris_app() -> None:
         }
         .tetris-cell.filled { box-shadow: inset 0 0 0 2px rgba(255,255,255,0.28), 0 0 13px rgba(255,255,255,0.12); }
         .tetris-cell.ghost { opacity: 0.26; outline: 1px dashed rgba(226,232,240,0.8); filter: saturate(0.8); }
+        .tetris-cell.line-clear {
+            background: linear-gradient(135deg, #ffffff, #66f6d2 48%, #ffffff) !important;
+            box-shadow: 0 0 20px rgba(255,255,255,0.95), inset 0 0 0 2px rgba(255,255,255,0.9);
+            animation: lineClearPulse 120ms ease-in-out infinite alternate;
+        }
+        @keyframes lineClearPulse {
+            from { filter: brightness(1); transform: scale(0.94); }
+            to { filter: brightness(1.8); transform: scale(1.04); }
+        }
         .tetris-cell.cyan { background: linear-gradient(135deg, #67e8f9, #0891b2); }
         .tetris-cell.yellow { background: linear-gradient(135deg, #fde047, #ca8a04); }
         .tetris-cell.purple { background: linear-gradient(135deg, #d8b4fe, #9333ea); }
@@ -754,6 +888,19 @@ def render_tetris_app() -> None:
             color: #66f6d2;
             transform: translateY(-1px);
         }
+        div.stButton > button[kind="primary"],
+        [data-testid="stBaseButton-primary"] {
+            border-color: rgba(102, 246, 210, 0.7);
+            background: linear-gradient(135deg, #66f6d2, #2dd4bf);
+            color: #06231f;
+            box-shadow: 0 0 22px rgba(45, 212, 191, 0.18);
+        }
+        div.stButton > button[kind="primary"]:hover,
+        [data-testid="stBaseButton-primary"]:hover {
+            border-color: #b9ffed;
+            background: linear-gradient(135deg, #b9ffed, #66f6d2);
+            color: #06231f;
+        }
         div[data-testid="stAlert"] { border-radius: 14px; }
         .move-card {
             border: 1px solid rgba(102, 246, 210, 0.25);
@@ -761,6 +908,16 @@ def render_tetris_app() -> None:
             padding: 0.95rem 1rem;
             background: linear-gradient(135deg, rgba(20, 71, 73, 0.28), rgba(15, 23, 42, 0.58));
         }
+        .mode-card {
+            margin-top: 1rem;
+            padding: 0.85rem 0.95rem;
+            border: 1px solid rgba(102, 246, 210, 0.16);
+            border-radius: 15px;
+            background: rgba(8, 47, 53, 0.2);
+        }
+        .mode-title { color: #e2e8f0; font-size: 0.86rem; font-weight: 800; }
+        .mode-copy { margin-top: 0.25rem; color: #94a3b8; font-size: 0.72rem; line-height: 1.45; }
+        .mode-caption { margin: 0.5rem 0 0.15rem; color: #64748b; font-size: 0.67rem; line-height: 1.4; }
         @media (max-width: 720px) {
             .hero-row { align-items: flex-start; flex-direction: column; gap: 1rem; }
             .hero-signal { text-align: left; }
@@ -771,14 +928,29 @@ def render_tetris_app() -> None:
         unsafe_allow_html=True,
     )
 
+    render_tetris_controls()
+
+
+@st.fragment(run_every="1s", key="tetris_game_loop")
+def render_tetris_controls() -> None:
     if "tetris_state" not in st.session_state:
         st.session_state["tetris_state"] = new_game()
+    if "tetris_trace_history" not in st.session_state:
+        st.session_state["tetris_trace_history"] = []
     state = st.session_state["tetris_state"]
 
+    if state["game_over"]:
+        st.session_state["tetris_auto_play"] = False
+    auto_running = bool(st.session_state.get("tetris_auto_play", False))
+
     if st.button("New game", key="tetris_new_game"):
-        st.session_state["tetris_state"] = new_game()
+        state = new_game()
+        st.session_state["tetris_state"] = state
         st.session_state.pop("tetris_suggestion", None)
-        st.rerun()
+        st.session_state.pop("tetris_auto_error", None)
+        st.session_state["tetris_trace_history"] = []
+        st.session_state["tetris_auto_play"] = False
+        auto_running = False
 
     board_column, control_column = st.columns([1.1, 0.9], gap="large")
     with board_column:
@@ -794,11 +966,15 @@ def render_tetris_app() -> None:
                 ("←", "↻", "→", "DROP"),
                 ("left", "rotate", "right", "drop"),
             ):
-                if column.button(label, key=f"tetris_{action}"):
+                if column.button(
+                    label,
+                    key=f"tetris_{action}",
+                    disabled=auto_running,
+                ):
                     if action == "drop":
                         animate_drop(state, board_view, animation_status)
                     apply_move(state, action)
-                    st.rerun()
+                    st.rerun(scope="fragment")
         animation_status.markdown(
             f'<div class="animation-status"><span class="signal-dot"></span>{state["last_event"]}</div>',
             unsafe_allow_html=True,
@@ -847,6 +1023,7 @@ def render_tetris_app() -> None:
         use_live = st.toggle(
             "Use live Jev",
             key="tetris_live",
+            value=has_key,
             disabled=not has_key,
             help="Ask Jev to choose one verified placement. The key stays server-side.",
         )
@@ -855,27 +1032,91 @@ def render_tetris_app() -> None:
         else:
             st.markdown('<div class="microcopy">No key detected. Local planner is available.</div>', unsafe_allow_html=True)
 
-        button_label = "Ask Jev for placement" if use_live else "Run local planner"
-        if st.button(button_label, key="tetris_suggest", disabled=state["game_over"]):
+        st.markdown(
+            '<div class="mode-card"><div class="mode-title">Choose Jev\'s control mode</div>'
+            '<div class="mode-copy">One move at a time for inspection, or let Jev keep playing until you pause.</div></div>',
+            unsafe_allow_html=True,
+        )
+        ask_column, auto_column = st.columns(2, gap="small")
+        with ask_column:
+            ask_clicked = st.button(
+                "Ask Jev for Placement",
+                key="tetris_suggest",
+                disabled=state["game_over"] or auto_running,
+                use_container_width=True,
+            )
+        with auto_column:
+            auto_clicked = st.button(
+                "Pause Jev" if auto_running else "Jev Playing Tetris",
+                key="tetris_auto",
+                type="secondary" if auto_running else "primary",
+                disabled=state["game_over"],
+                use_container_width=True,
+            )
+        st.markdown(
+            '<div class="mode-caption">Placement asks for one typed decision. Playing Tetris makes one '
+            'verified decision per tick and stays responsive between moves.</div>',
+            unsafe_allow_html=True,
+        )
+
+        auto_error = st.session_state.get("tetris_auto_error")
+        if auto_error:
+            st.error(auto_error)
+
+        if auto_clicked:
+            st.session_state["tetris_auto_play"] = not auto_running
+            st.session_state.pop("tetris_auto_error", None)
+            st.rerun(scope="fragment")
+
+        if ask_clicked:
             try:
-                if use_live:
-                    candidate, confidence, probabilities = live_next_placement(state)
-                    source = "live Jev"
-                else:
-                    candidate, confidence = fixture_next_placement(state)
-                    probabilities = {}
-                    source = "local planner"
+                candidate, confidence, probabilities, source, trace = choose_next_placement(
+                    state,
+                    use_live=use_live,
+                )
                 animate_placement(state, candidate, board_view, animation_status)
                 apply_placement(state, candidate["id"])
+                trace = _record_decision_trace(
+                    st.session_state["tetris_trace_history"],
+                    trace,
+                    state,
+                    "single",
+                )
                 st.session_state["tetris_suggestion"] = {
                     "source": source,
                     "candidate": candidate,
                     "confidence": confidence,
                     "probabilities": probabilities,
+                    "trace": trace,
                 }
-                st.rerun()
+                st.rerun(scope="fragment")
             except Exception as exc:
                 st.error(f"Could not choose a placement: {exc}")
+
+        if auto_running and not state["game_over"]:
+            try:
+                candidate, confidence, probabilities, source, trace = choose_next_placement(
+                    state,
+                    use_live=use_live,
+                )
+                animate_placement(state, candidate, board_view, animation_status)
+                apply_placement(state, candidate["id"])
+                trace = _record_decision_trace(
+                    st.session_state["tetris_trace_history"],
+                    trace,
+                    state,
+                    "automatic",
+                )
+                st.session_state["tetris_suggestion"] = {
+                    "source": f"{source} · auto",
+                    "candidate": candidate,
+                    "confidence": confidence,
+                    "probabilities": probabilities,
+                    "trace": trace,
+                }
+            except Exception as exc:
+                st.session_state["tetris_auto_play"] = False
+                st.session_state["tetris_auto_error"] = f"Jev paused after an error: {exc}"
 
         suggestion = st.session_state.get("tetris_suggestion")
         if suggestion is not None:
@@ -902,6 +1143,35 @@ def render_tetris_app() -> None:
                     "Jev alternatives: "
                     + " · ".join(f"{label} {probability:.0%}" for label, probability in alternatives)
                 )
+
+        trace_history = st.session_state["tetris_trace_history"]
+        if trace_history:
+            latest_trace = trace_history[-1]
+            request_label = "sent to Jev" if latest_trace["request_sent"] else "preview only — local planner"
+            st.markdown(
+                '<div class="panel-kicker">Decision trace</div>',
+                unsafe_allow_html=True,
+            )
+            export_column, trace_info_column = st.columns([0.42, 0.58], gap="small")
+            with export_column:
+                st.download_button(
+                    "Export JSON trace",
+                    data=decision_trace_export(trace_history),
+                    file_name="jev-tetris-decision-trace.json",
+                    mime="application/json",
+                    key="tetris_trace_download",
+                    type="primary",
+                    use_container_width=True,
+                )
+            with trace_info_column:
+                st.caption(
+                    f"{len(trace_history)} decision(s) · latest: {request_label}. "
+                    "Export includes this game's full history."
+                )
+            with st.expander("View JSON input · state and question", expanded=False):
+                st.json(latest_trace["request"], expanded=1)
+            with st.expander("View JSON output · Jev response", expanded=True):
+                st.json(latest_trace["response"], expanded=True)
 
         st.markdown(
             '<div class="microcopy">The ghost piece shows the collision-checked landing position. '
@@ -931,6 +1201,7 @@ def _show_animation_frame(
     pose: tuple[str, int, int, int] | None = None,
     board: list[list[str | None]] | None = None,
     show_active: bool = True,
+    flash_rows: set[int] | None = None,
     delay: float = 0.04,
 ) -> None:
     board_view.markdown(
@@ -940,6 +1211,7 @@ def _show_animation_frame(
             active_pose=pose,
             show_active=show_active,
             show_ghost=False,
+            flash_rows=flash_rows,
         ),
         unsafe_allow_html=True,
     )
@@ -948,6 +1220,95 @@ def _show_animation_frame(
         unsafe_allow_html=True,
     )
     time.sleep(delay)
+
+
+def _animation_path(
+    state: dict[str, Any],
+    candidate: Mapping[str, Any],
+) -> list[tuple[int, int, int]]:
+    kind = state["kind"]
+    board = state["board"]
+    start = (state["rotation"] % 4, state["x"], state["y"])
+    goal = (candidate["rotation"], candidate["origin_x"], candidate["origin_y"])
+    if start == goal:
+        return [start]
+
+    # Keep rotation in the setup phase so the animation never twists while falling.
+    required_rotations = (goal[0] - start[0]) % 4
+    start_key = (*start, False, 0)
+    frontier = deque([start_key])
+    previous: dict[
+        tuple[int, int, int, bool, int], tuple[int, int, int, bool, int] | None
+    ] = {start_key: None}
+    while frontier:
+        rotation, x, y, drop_started, rotation_steps = frontier.popleft()
+        neighbors = [
+            (rotation, x - 1, y, drop_started, rotation_steps),
+            (rotation, x + 1, y, drop_started, rotation_steps),
+            (rotation, x, y + 1, True, rotation_steps),
+        ]
+        if not drop_started and rotation_steps < required_rotations:
+            next_rotation = (rotation + 1) % 4
+            neighbors.extend(
+                (next_rotation, x + kick_x, y - kick_y_up, False, rotation_steps + 1)
+                for kick_x, kick_y_up in _kick_tests(kind, rotation, next_rotation)
+            )
+        for next_key in neighbors:
+            if next_key in previous:
+                continue
+            next_r, next_x, next_y, _, _ = next_key
+            if not can_place_on_board(board, kind, next_r, next_x, next_y):
+                continue
+            previous[next_key] = (rotation, x, y, drop_started, rotation_steps)
+            if next_key[:3] == goal:
+                path = [goal]
+                current_key = next_key
+                while current_key != start_key:
+                    current_key = previous[current_key]
+                    path.append(current_key[:3])
+                return list(reversed(path))
+            frontier.append(next_key)
+
+    return [start, goal]
+
+
+def _animate_line_clear(
+    state: dict[str, Any],
+    locked_board: list[list[str | None]],
+    board_view: Any,
+    animation_status: Any,
+) -> None:
+    full_rows = {
+        row_index
+        for row_index, row in enumerate(locked_board)
+        if all(cell is not None for cell in row)
+    }
+    if not full_rows:
+        return
+
+    _show_animation_frame(
+        board_view,
+        animation_status,
+        state,
+        f"Clearing {len(full_rows)} line(s)…",
+        board=locked_board,
+        show_active=False,
+        flash_rows=full_rows,
+        delay=0.22,
+    )
+    cleared_board = [
+        [None for _ in range(BOARD_WIDTH)] if row_index in full_rows else row[:]
+        for row_index, row in enumerate(locked_board)
+    ]
+    _show_animation_frame(
+        board_view,
+        animation_status,
+        state,
+        "Lines cleared — settling the board…",
+        board=cleared_board,
+        show_active=False,
+        delay=0.14,
+    )
 
 
 def animate_drop(state: dict[str, Any], board_view: Any, animation_status: Any) -> None:
@@ -977,6 +1338,7 @@ def animate_drop(state: dict[str, Any], board_view: Any, animation_status: Any) 
         show_active=False,
         delay=0.16,
     )
+    _animate_line_clear(state, locked_board, board_view, animation_status)
 
 
 def animate_placement(
@@ -986,12 +1348,6 @@ def animate_placement(
     animation_status: Any,
 ) -> None:
     kind = state["kind"]
-    rotation = state["rotation"] % 4
-    x = state["x"]
-    y = state["y"]
-    target_rotation = candidate["rotation"]
-    target_x = candidate["origin_x"]
-    target_y = candidate["origin_y"]
     label = candidate["id"]
 
     _show_animation_frame(
@@ -1000,40 +1356,27 @@ def animate_placement(
         state,
         f"Jev chose {label}: rotating to {candidate['rotation_name']}, "
         f"moving to column {candidate['column']}…",
-        pose=(kind, rotation, x, y),
+        pose=(kind, state["rotation"], state["x"], state["y"]),
         delay=0.1,
     )
 
-    while rotation != target_rotation:
-        rotation = (rotation + 1) % 4
+    path = _animation_path(state, candidate)
+    for previous_pose, next_pose in zip(path, path[1:]):
+        previous_rotation, previous_x, previous_y = previous_pose
+        rotation, x, y = next_pose
+        if rotation != previous_rotation:
+            message = f"Rotating {kind} to {ROTATION_NAMES[rotation]}…"
+        elif x != previous_x:
+            message = f"Moving to column {candidate['column']}…"
+        else:
+            message = f"Dropping to row {candidate['landing_row']}…"
         _show_animation_frame(
             board_view,
             animation_status,
             state,
-            f"Rotating {kind} to {ROTATION_NAMES[rotation]}…",
+            message,
             pose=(kind, rotation, x, y),
-            delay=0.05,
-        )
-
-    while x != target_x:
-        x += 1 if target_x > x else -1
-        _show_animation_frame(
-            board_view,
-            animation_status,
-            state,
-            f"Moving to column {candidate['column']}…",
-            pose=(kind, rotation, x, y),
-            delay=0.04,
-        )
-
-    for drop_y in range(y, target_y + 1):
-        _show_animation_frame(
-            board_view,
-            animation_status,
-            state,
-            f"Dropping to row {candidate['landing_row']}…",
-            pose=(kind, rotation, x, drop_y),
-            delay=0.025,
+            delay=0.035,
         )
 
     locked_board = _board_with_piece(
@@ -1051,6 +1394,7 @@ def animate_placement(
         show_active=False,
         delay=0.18,
     )
+    _animate_line_clear(state, locked_board, board_view, animation_status)
 
 
 def render_board(
@@ -1060,8 +1404,10 @@ def render_board(
     active_pose: tuple[str, int, int, int] | None = None,
     show_active: bool = True,
     show_ghost: bool = True,
+    flash_rows: set[int] | None = None,
 ) -> str:
     visible_board = state["board"] if board is None else board
+    flash_rows = flash_rows or set()
     if active_pose is None:
         active_kind = state["kind"]
         active_rotation = state["rotation"]
@@ -1097,6 +1443,8 @@ def render_board(
             else:
                 kind = locked_kind
                 extra_class = " filled" if kind else ""
+                if kind and y in flash_rows:
+                    extra_class += " line-clear"
             color = PIECE_COLORS.get(kind, "")
             cells.append(f'<div class="tetris-cell {color}{extra_class}"></div>')
     return '<div class="tetris-board">' + "".join(cells) + '</div>'
