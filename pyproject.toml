@@ -1,0 +1,13 @@
+[project]
+name = "jev-experiment"
+version = "0.1.0"
+description = "Jev chooses verified Tetris placements with TypeSafe."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit",
+    "typesafe-sdk>=0.5.7",
+]
+
+[tool.uv]
+package = false
